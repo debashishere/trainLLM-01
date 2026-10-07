@@ -304,15 +304,150 @@ class CausalSelfAttention(nn.Module):
         # weights × V
         # ↓
         # y
-
         #Attention does not change the overall dimensions.
         #It changes the information inside the vectors.
         #Each token still has 64 dimensions per head
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=True
         )
+
         # current shape of y (B, heads, T, head_dim)
-        # We required : (B, T, heads, head_dim) , so we are applying transpose
+        # We required : (B, T, heads, head_dim) , so we are applying transpose() function to swap the dimensions 1 and 2.
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+
         return self.c_proj(y)
+
+
+# Attention = tokens talk to other tokens.
+# MLP = each token processes and transforms its own information.
+#                  x
+#                  │
+#        ┌────────▼────────┐
+#        │    Attention    │
+#        │ "Who should I   │
+#        │    listen to?"  │
+#        └────────┬────────┘
+#                 │
+#          Residual Add
+#                 │
+#        ┌────────▼────────┐
+#        │      MLP        │
+#        │ "What should I  │
+#        │    understand?" │
+#        └────────┬────────┘
+#                 │
+#          Residual Add
+#                 │
+#                 ▼
+#              output
+
+# So, Attention → communication
+# MLP → processing
+
+# The MLP temporarily gives the token more room to think
+# The complete MLP journey
+# Input
+# (B, T, 384)
+#      │
+#      ▼
+#┌──────────────┐
+#│ Linear       │
+#│ 384 → 1536   │
+#└──────┬───────┘
+#       │
+#       ▼
+#(B,T,1536)
+#       │
+#       ▼
+#┌──────────────┐
+#│ GELU         │
+#│ nonlinear    │
+#└──────┬───────┘
+#       │
+#       ▼
+#(B,T,1536)
+#       │
+#       ▼
+#┌──────────────┐
+#│ Linear       │
+#│ 1536 → 384   │
+#└──────┬───────┘
+#       │
+#       ▼
+#(B,T,384)
+
+# x
+# │
+# ├── Linear(384 → 1536)
+# │
+# ├── GELU
+# │
+# └── Linear(1536 → 384)
+# │
+# ▼
+# output
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+       # Linear transformation
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+       # The 4× expansion is a common Transformer design choice.
+       # It's not because the token suddenly has 4 times more information in some literal sense. 
+       # It gives the neural network more dimensions in which to perform nonlinear computation.
+       # creates learnable parameters roughly equivalent to 4 * 384 = 1536 nurons
+       # Every one of the 1536 output neurons looks at the 384 input values.
+       # output = input * weights + bias
+       # c_fc means roughly: Take the token's 384-dimensional representation and 
+       # transform it into a richer 1536-dimensional representation.
+
+        # Use the GELU activation, with a faster tanh-based approximation.
+        # GELU(x) = x · Φ(x), Φ(x) is the standard normal cumulative distribution function.
+        self.gelu = nn.GELU(approximate='tanh')
+        # GELU allows the network to learn much more complicated patterns.
+        # GELU This is the nonlinear part of the MLP.
+        # Without GELU: the two Linear operations could effectively collapse into another linear transformation.
+        # GELU breaks that simple linear relationship.
+        # Think of it as a smart gate:
+        # 1536 signals
+        #   │
+        #   ▼
+        #  GELU
+        #   │
+        #   ├── strongly useful → pass strongly
+        #   ├── somewhat useful → pass partially
+        #   └── less useful → suppress
+        
+        
+        
+        # Transformation go back to 384
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        # Rest of the Transformer expects the model representation to remain: (B, T, 384)
+        # So the MLP temporarily expands the representation:
+        # 384
+        # ↓
+        # 1536
+        # ↓
+        # 384
+        # This allows the MLP to do complex processing while maintaining a consistent interface between Transformer blocks.
+        # The 384 → 1536 → 384 transformation happens independently for every token.
+
+        # c_fc = expand the brain
+        # GELU = nonlinear thinking/gating
+        # c_proj = compress back to model size
+
+        # So your MLP is essentially
+        #         EXPAND              THINK          COMPRESS
+        # 384 ──────────────► 1536 ──────────► 1536 ──────────► 384
+        # c_fc              GELU              c_proj
+
+        # And that's why the MLP is often described as the Transformer's position-wise feed-forward network.
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
 
