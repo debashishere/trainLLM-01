@@ -311,7 +311,8 @@ class CausalSelfAttention(nn.Module):
         y = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=True
         )
-
+        # current shape of y (B, heads, T, head_dim)
+        # We required : (B, T, heads, head_dim) , so we are applying transpose
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
