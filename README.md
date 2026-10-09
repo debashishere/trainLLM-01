@@ -2,9 +2,8 @@
 
 A complete step-by-step implementation of an autoregressive GPT language model trained from scratch on Apple Silicon using PyTorch.
 
-For in-depth architecture explanations, mathematical formulations, configuration details, and guides, see **[Doc.md](Doc.md)**.
+For in-depth architecture explanations, mathematical formulations, configuration details, and guides, see **[Doc.md](Doc.md)** & **[design-document.md](design-document.md)**..
 
-Design Document : **{design-document.md}**
 
 ## Quickstart
 
