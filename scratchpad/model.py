@@ -1,5 +1,37 @@
 
-# Import Data Class
+
+# The Model
+# INPUT
+#  │
+#  ▼
+# LayerNorm
+#  │
+#  ▼
+# Attention ─────┐
+#  │            │
+#  └── + INPUT ◄┘
+#  │
+#  ▼
+# LayerNorm
+#  │
+#  ▼
+# MLP ───────────┐
+# │            │
+#  └── + INPUT ◄┘
+#  │
+#  ▼
+# OUTPUT
+
+
+
+
+
+
+from hashlib import new
+from sympy.core import expr
+from torch.nn import GELU
+from torch._dynamo.config import config
+from torch.ao.nn.quantized.modules.normalization import LayerNorm
 from torch.nn import quantized
 from dataclasses import dataclass
 
@@ -8,9 +40,9 @@ from dataclasses import dataclass
 class GPTConfig:
     vocab_size : int = 65                                   # character-levl: 65 unique chars in Shakespare
     block_size : int = 256                                  # max sequency length (context window) , Number of Token Model Can see at Once
+    n_embd: int = 384                                      # embbeding dimention, width of the model — every hidden state is a vector of this size.
     n_layer: int = 6                                        # number of transformer blocks
     n_head: int = 6                                         # number of attention heads
-    n_embd: int = 384                                       # embbeding dimention, width of the model — every hidden state is a vector of this size.
 
 
     
@@ -33,14 +65,35 @@ class GPT(nn.Module):
                         Block(config) for _ in range(config.n_layer)
                         ]
                     ),
-                # Normalization the embbedings
+                # Normalization all the embbedings
                 ln_f = nn.LayerNorm(config.n_embd),
 
         )
         )
         # To find the head we need to know the Embbeding vector's size (n_embd) and Vocab Size
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # lm_head  initially contains the weight matrix of dimention vocab_size, n_embd, eg: W = shape (65, 384) weight matrix
+        # weights = learnable parameters, not measurements/metrics.
+        # Each row is a learned 384-dimensional scoring vector for one token.
+        # 384-dimensional x
+        #                ↓
+        # ┌──────────────────┐
+        # │      W (65×384)  │
+        # └──────────────────┘
+        #      ↓  matrix multiply
+        #      65 numbers
+        #       ↓
+        #     logits
+        # 65 rows × 384 dimensions = 65 logits
+        # Those 65 logits correspond to your 65 possible next tokens.
+        # Then softmax converts those 65 logits into 65 probabilities.
+        #the 65 × 384 matrix is not the same thing as your token embedding matrix wte, 
+        # even though both can have a 384-dimensional vector associated with each token. 
+        # In some GPT implementations they may even be weight-tied, but your code with a separate lm_head has its own matrix.
+
         # weight typing: the output projection shares weights with the token embeddings
+        # Use the exact same weight matrix for the token embedding (wte) and the output layer (lm_head).
+        # The embedding layer asks "What does token a represent?" & The lm_head asks: "How well does the current representation match token a?"
         self.transformer.wte.weight = self.lm_head.weight
 
 
@@ -97,16 +150,66 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         
+        assert config.n_embd % config.n_head == 0
         #“Can I divide the embedding dimensions equally among all attention heads?”
         # assert means “This condition MUST be true. If it isn't, stop the program.”
-        assert config.n_embd % config.n_head == 0
         
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)  
         # Q, K, V projections, Q(Query : “What information am I looking for?”),
         # K(Key: “What information do I contain?”),
         # V(Value: “What information do I offer?”).    
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)  
+        # nn.Linear is basically a learnable matrix multiplication.
+        # c_attn produces one 1152-dimensional( 3 * 384) output, which is then split into three 384-dimensional parts:   Q (384) , K (384) , V(384)  
+
+        # y = xWᵀ + b
+        # Input:   384 numbers
+        #    ↓
+        # [learnable weights]
+        #    ↓
+        # Output:   65 numbers
+        # ONE TOKEN
+        # │
+        # ▼
+        # 384 numbers
+        # │
+        # ├────────────── c_attn ──────────────┐
+        # │                                    ▼
+        # │                              1152 numbers
+        # │                              /    |    \
+        # │                             Q     K     V
+        # │
+        # │          attention happens
+        # │                 ↓
+        # │
+        # └──────────────► 384 numbers
+        #                 │
+        #                 │ Transformer blocks
+        #                 ▼
+        #                 384 numbers
+        #                 │
+        #                 │ lm_head
+        #                 ▼
+        #                 65 numbers
+        #                 │
+        #                 65 possible tokens
+
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)       
+        # The 6 attention heads have learned different things.
+        # c_proj learns how to mix and transform those combined head outputs into a useful 384-dimensional representation.
+        # Q/K/V
+        # ↓
+        # 6 attention heads
+        # ↓
+        # "6 specialists give their information"
+        # ↓
+        # combine → 384
+        # ↓
+            # c_proj
+        # ↓
+        # "combine their information intelligently"
+        # ↓
+        # 384
         
         #“Each token has 384 numbers, and I want to use 6 attention heads.”
         self.n_head = config.n_head
@@ -445,9 +548,146 @@ class MLP(nn.Module):
         # And that's why the MLP is often described as the Transformer's position-wise feed-forward network.
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        x = self.c_fc(x)       # project up: 384 → 1536
+        x = self.gelu(x)       # non-linearity
+        return self.c_proj(x)  # project back down: 1536 → 384
+
+
+
+# Transformer
+class Block(nn.Module):
+    def __init__(self, config):
+        # This creates the Transformer Block and initializes the PyTorch nn.Module machinery.
+        # I'm creating one Transformer Block and registering everything inside it.
+        super().__init__()
+        # Normalize all token vector value
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        # Create Attention Mechanism ( explroed above), it's job is Allow each token to gather useful information from previous tokens.
+        self.attn = CausalSelfAttention(config)
+        # Another LayerNorm, Because we have two different processing stages:
+        # LayerNorm 1 → Attention
+        # LayerNorm 2 → MLP
+        # So,
+        # ln_1 → prepares representation for attention
+        # ln_2 → prepares representation for MLP
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        # This creates the MLP we just explored.
+        # 384
+        # ↓
+        # 1536
+        # ↓
+        # GELU
+        # ↓
+        # 384
+        # Take the information gathered by attention and perform nonlinear processing on each token's representation.
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))   # self-attention with residual
+        # The + x — Residual connection
+        # "Keep what I already know, and add what attention just taught me."
+        # original x + attention's new information = updated x
+        # Residual connection gives the model a shortcut.
+
+        #            ┌───────────────┐
+        #            │               │
+        #            │   original x  │
+        #            │               │
+        #            ▼              │
+        # x ───────► LayerNorm ─► Attention ─► +
+        #                                      │
+        #                                      ▼
+        # This makes deep Transformer networks much easier to train and 
+        # lets each block learn incremental improvements rather than having to recreate everything from scratch.
+
+        # Second residual connection
+        # x + MLP_output
+        # updated x + MLP's new information = new updated x
+        # 1. Gather information from other tokens
+        # 2. Process that information
+        x = x + self.mlp(self.ln_2(x))   # MLP with residual
         return x
 
+
+
+
+
+# The complete journey
+
+#                     INPUT
+#                       │
+#                       │ (B,T,384)
+#                       ▼
+#                ┌─────────────┐
+#                │ LayerNorm 1 │
+#                └──────┬──────┘
+#                       │
+#                       ▼
+#                ┌─────────────┐
+#                │  Attention  │
+#                │             │
+#                │ Q,K,V       │
+#                │ 6 heads     │
+#                │ causal mask │
+#                └──────┬──────┘
+#                       │
+#                       ▼
+#                 Attention
+#                  output
+#                       │
+#                       │
+#       ┌───────────────┘
+#       │
+#       │        original x
+#       │             │
+#       │             ▼
+#       └────────────► +
+#                       │
+#                       ▼
+#                  Updated x
+#                       │
+#                       ▼
+#                ┌─────────────┐
+#                │ LayerNorm 2 │
+#                └──────┬──────┘
+#                       │
+#                       ▼
+#                   ┌───────┐
+#                   │  MLP  │
+#                   │       │
+#                   │384    │
+#                   │ ↓     │
+#                   │1536   │
+#                   │ ↓     │
+#                   │GELU   │
+#                   │ ↓     │
+#                   │384    │
+#                   └───┬───┘
+#                       │
+#                       ▼
+#                    MLP
+#                   output
+#                       │
+#       ┌───────────────┘
+#       │
+#       │        updated x
+#       │             │
+#       │             ▼
+#       └────────────► +
+#                       │
+#                       ▼
+#                     OUTPUT
+#                  (B,T,384)
+
+
+
+
+# Key Takeaways
+
+# A GPT is a stack of identical transformer blocks
+# Each block: LayerNorm → Self-Attention → Residual → LayerNorm → MLP → Residual
+# Self-attention lets tokens look at all previous tokens (causal masking prevents looking ahead)
+# Multi-head attention runs multiple attention patterns in parallel
+# Residual connections and layer norm make deep networks trainable
+# Weight tying between input embeddings and output projection reduces parameters
 
