@@ -122,7 +122,7 @@ def train(
     min_lr = max_lr * 0.1
     warmup_steps = 100
 
-    loss_log = {"steps": [], "train": [], "val": []}
+    loss_log = {"steps": [], "train": [], "val_steps": [], "val": []}
     val_loss = float("nan")
 
     pbar = tqdm(range(max_steps), desc="Training")
@@ -161,6 +161,7 @@ def train(
         loss_log["steps"].append(step)
         loss_log["train"].append(loss.item())
         if step % 100 == 0:
+            loss_log["val_steps"].append(step)
             loss_log["val"].append(val_loss)
 
         # --- Sample Generation ---
@@ -205,6 +206,13 @@ def train(
 
     with open("loss_log.json", "w", encoding="utf-8") as f:
         json.dump(loss_log, f, indent=2)
+
+    # Automatically generate loss curve plot
+    try:
+        from plot_loss import plot_loss
+        plot_loss(log_file="loss_log.json", output_file="loss_curve.png", show=False)
+    except Exception as e:
+        print(f"Plot generation skipped: {e}")
 
     return model, stoi, itos
 

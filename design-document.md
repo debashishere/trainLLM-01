@@ -410,6 +410,14 @@ Reference Implementation: [`scratchpad/train.py`](file:///Users/debashisroy/Docu
 2. `loss.backward()`: Reverse-mode autodiff through the computation graph.
 3. `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)`: Caps total gradient norm to 1.0. Essential for transformer stability to prevent sudden loss spikes caused by rare extreme batches.
 4. Periodic Validation (`model.eval()` + `torch.no_grad()`): Evaluates loss on 20 validation batches to monitor overfitting without storing activation graphs.
+( If loss going down but val_loss going up ( loss for unseen token) the model is overfitting, the respective model Performing well at 45% - 48% of training loop )
+Good learning : Learns reusable language patterns and predicts unseen text better.
+Overfitting : Memorizes training examples but struggles with new text.
+
+You can detect overfitting by tracking two losses:
+Training loss: How well the model predicts text it trains on.
+Validation loss: How well it predicts separate text it hasn't trained on.
+
 
 ---
 
@@ -449,6 +457,52 @@ Repeat for max_new_tokens
    Only the top $K$ most probable tokens are retained. All other logits are masked to $-\infty$ before softmax, preventing unlikely tail tokens from corrupting text coherence.
 4. **Context Window Cropping:**
    If generated sequence length exceeds `block_size` (256), only the most recent 256 tokens are fed to the model: `idx_cond = idx[:, -model.config.block_size:]`.
+
+---
+
+## 13. Training Loss Diagnostics & Overfitting Analysis
+
+Reference Implementation: [`scratchpad/plot_loss.py`](file:///Users/debashisroy/Documents/trainLLM-01/scratchpad/plot_loss.py)
+
+### Visualizing the Training Curve
+To diagnose model behavior, `loss_log.json` tracks training loss every step and validation loss every 100 steps.
+
+```python
+import json
+import matplotlib.pyplot as plt
+
+with open("loss_log.json") as f:
+    log = json.load(f)
+
+plt.figure(figsize=(10, 6))
+plt.plot(log["steps"], log["train"], alpha=0.3, label="train")
+if "val" in log:
+    val_steps = log.get("val_steps", [s for s in log["steps"] if s % 100 == 0][:len(log["val"])])
+    plt.plot(val_steps, log["val"], "ro-", linewidth=2, label="val")
+
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.legend()
+plt.savefig("loss_curve.png")
+plt.show()
+```
+
+### Diagnosing the Overfitting Signature
+```
+Loss
+  ▲
+  │  Training Loss ───► Keeps dropping (model memorizes training text)
+  │
+  │  Validation Loss ──► Bottoms out at ~45%-48% (~step 2,400) and climbs ⚠️ (Overfitting)
+  │                    ╭──────────────────────
+  │            ───────╯
+  └─────────────────────────────────────────────► Steps
+```
+1. **The Sweet Spot:** When training loss drops but validation loss turns upward, the model transitions from generalizing language structure to memorizing exact sequences.
+2. **Actionable Remedies:**
+   - Save `checkpoint_best.pt` when `val_loss` hits its minimum.
+   - Align `max_steps` with the optimal window so cosine decay finishes at `min_lr` during peak generalization.
+   - Introduce dropout regularization (`0.1`–`0.2`) or higher weight decay.
 
 ---
 
